@@ -9,6 +9,7 @@ Classifier: Framework :: Django
 Classifier: Programming Language :: Python :: 3
 Classifier: License :: OSI Approved :: MIT License
 Classifier: Operating System :: OS Independent
+Requires-Python: >=3.6
 Requires-Dist: Django>=3.2
 Requires-Dist: djangorestframework
 Dynamic: author
@@ -16,4 +17,5 @@ Dynamic: author-email
 Dynamic: classifier
 Dynamic: home-page
 Dynamic: requires-dist
+Dynamic: requires-python
 Dynamic: summary
