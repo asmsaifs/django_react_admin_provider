@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: django-react-admin
+Version: 0.1.0
+Summary: Dynamic Django DRF backend for React-Admin
+Home-page: https://github.com/asmsaifs/django-react-admin
+Author: ASM Saiful Islam Chowdhury
+Author-email: asmsaifs@yahoo.com
+Classifier: Framework :: Django
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Dist: Django>=3.2
+Requires-Dist: djangorestframework
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: home-page
+Dynamic: requires-dist
+Dynamic: summary
