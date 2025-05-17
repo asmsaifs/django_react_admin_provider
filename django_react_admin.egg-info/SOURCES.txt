@@ -3,7 +3,6 @@ README.md
 setup.py
 django_react_admin/__init__.py
 django_react_admin/serializers.py
-django_react_admin/urls.py
 django_react_admin/views.py
 django_react_admin.egg-info/PKG-INFO
 django_react_admin.egg-info/SOURCES.txt

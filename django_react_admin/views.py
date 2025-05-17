@@ -1,51 +1,56 @@
 import csv
 import io
+from uuid import UUID
 from datetime import datetime
+
 from django.apps import apps
 from django.db import transaction
 from django.db.models import Q
-from serializers import dynamic_serializer
-from rest_framework import viewsets, status
-from rest_framework.decorators import action, api_view
-from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework import status, viewsets
+from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.parsers import JSONParser, MultiPartParser, FormParser
-from rest_framework.permissions import BasePermission, SAFE_METHODS
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.permissions import BasePermission, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.decorators import api_view
 
 
 class AdminFullAccess(BasePermission):
     def has_permission(self, request, view):
-        # Allow GET for all authenticated users
-        if request.method in SAFE_METHODS:
-            return request.user and request.user.is_authenticated
-        # Allow POST/PUT/DELETE only for Admins
-        return request.user and request.user.is_staff
+        # # Allow GET for all authenticated users
+        # if request.method in SAFE_METHODS:
+        #     return request.user and request.user.is_authenticated
+        # # Allow POST/PUT/DELETE only for Admins
+        # return request.user and request.user.is_staff
+        return True
 
 
 class RoleBasedPermission(BasePermission):
     def has_permission(self, request, view):
-        import pdb; pdb.set_trace()
-        if view.action in ['list', 'retrieve', 'get_many']:
-            return request.user.is_authenticated  # All logged in users
-        elif view.action in ['create', 'update', 'update_many']:
-            return request.user.groups.filter(name__in=['Staff', 'admin']).exists()
-        elif view.action in ['destroy', 'delete_many']:
-            return request.user.is_superuser  # Only superadmins
-        return False
+        # import pdb; pdb.set_trace()
+        # if view.action in ['list', 'retrieve', 'get_many']:
+        #     return request.user.is_authenticated  # All logged in users
+        # elif view.action in ['create', 'update', 'update_many']:
+        #     return request.user.groups.filter(name__in=['Staff', 'admin']).exists()
+        # elif view.action in ['destroy', 'delete_many']:
+        #     return request.user.is_superuser  # Only superadmins
+        # return False
+        return True
 
 
 class IsAdminOrReadOnly(IsAuthenticated):
     def has_permission(self, request, view):
-        is_authenticated = super().has_permission(request, view)
-        if request.method in ('GET', 'HEAD', 'OPTIONS'):
-            return is_authenticated
-        return is_authenticated and request.user.is_staff
+        # is_authenticated = super().has_permission(request, view)
+        # if request.method in ('GET', 'HEAD', 'OPTIONS'):
+        #     return is_authenticated
+        # return is_authenticated and request.user.is_staff
+        return True
 
 
 def model_to_dict(instance, exclude_password=True):
     data = {}
     for field in instance._meta.fields:
+        # print("field:", field)
         value = getattr(instance, field.name)
         if exclude_password and field.name == "password":
             continue
@@ -108,6 +113,25 @@ def get_model(app_label, model_name):
 def parse_filters(filters, Model):
     q = Q()
     for key, value in filters.items():
+        if isinstance(value, str) and value.startswith("[") and value.endswith("]"):
+            # Convert string representation of a list to an actual list
+            try:
+                value = eval(value)
+            except Exception:
+                pass
+
+        if isinstance(value, list) and len(value) == 1:
+            # If the value is a single-item list, extract the item
+            value = value[0]
+
+        # Check if the field is a UUIDField
+        field = next((f for f in Model._meta.fields if f.name == key.split("|")[0]), None)
+        if field and field.get_internal_type() == "UUIDField":
+            try:
+                value = UUID(value)  # Validate and convert to UUID
+            except (ValueError, TypeError):
+                raise ValueError(f"'{value}' is not a valid UUID.")
+
         if "|op=" in key:
             field, op = key.split("|op=")
             if op in ("like", "ilike"):
@@ -141,6 +165,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
     # permission_classes = [IsAdminOrReadOnly]
     permission_classes = [RoleBasedPermission]
     parser_classes = [JSONParser, MultiPartParser, FormParser]
+    # app_label = "clothingapp"
 
     def get_model(self, app_label, model_name):
         model = get_model(app_label, model_name)
@@ -151,9 +176,25 @@ class DynamicModelViewSet(viewsets.ViewSet):
 
     def list(self, request, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
-        filters = request.data.get("filter", {})
-        sort = request.data.get("sort", ["id", "ASC"])
-        range_ = request.data.get("range", [0, 9])
+        filters = eval(request.GET.dict().get("filter", "{}"))
+
+        sort_param = request.GET.get("sort")
+        if sort_param:
+            try:
+                sort = eval(sort_param)
+                if not isinstance(sort, list) or len(sort) != 2:
+                    raise ValueError("Sort parameter must be a list with two elements.")
+            except Exception as e:
+                return Response(
+                    {"error": f"Invalid sort parameter: {str(e)}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            sort = [Model._meta.pk.name or Model._meta.fields[0].name, "ASC"]
+
+        if not isinstance(sort, list) or len(sort) != 2:
+            return Response({"error": "Invalid sort parameter"}, status=status.HTTP_400_BAD_REQUEST)
+        range_ = eval(request.GET.dict().get("range", "[0, 9]"))
 
         queryset = Model.objects.all()
         if filters:
@@ -170,19 +211,15 @@ class DynamicModelViewSet(viewsets.ViewSet):
         paginator = PageNumberPagination()
         paginator.page_size = range_[1] - range_[0] + 1
         page = paginator.paginate_queryset(queryset, request)
-
-        Serializer = dynamic_serializer(Model, nested_depth=1)
-        serializer = Serializer(page, many=True)
-
-        return paginator.get_paginated_response(
-            {"data": serializer.data, "total": queryset.count()}
-        )
+        response = Response([model_to_dict(obj) for obj in page])
+        response["Content-Range"] = f"{range_[0]}-{range_[1]}/{queryset.count()}"
+        return response
 
     def retrieve(self, request, pk=None, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
         try:
             obj = Model.objects.get(pk=pk)
-            return Response({"data": model_to_dict(obj)})
+            return Response(model_to_dict(obj))
         except Model.DoesNotExist:
             return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -191,12 +228,15 @@ class DynamicModelViewSet(viewsets.ViewSet):
         Model = self.get_model(app_label, model_name)
         data = dict(request.data)
 
+        if "created_by" in [f.name for f in Model._meta.fields]:
+            data["created_by"] = request.user.id
+
+        data["created_at"] = datetime.utcnow()
         update_relation(Model, data)
 
         # Detect child tables (list-type fields)
         children = {k: v for k, v in data.items() if isinstance(v, list)}
         parent_data = {k: v for k, v in data.items() if not isinstance(v, list)}
-
         # Create parent
         if "created_at" in [f.name for f in Model._meta.fields]:
             parent_data["created_at"] = datetime.utcnow()
@@ -211,21 +251,22 @@ class DynamicModelViewSet(viewsets.ViewSet):
             except Exception:
                 continue
 
-            # fk_field = f"{model_name.lower()}_id"  # e.g. order_id
             fk_field = get_foreign_key_field(child_model, Model)
             if not fk_field:
                 continue
+
+            # Set created_by for children if field exists
+            child_fields = [f.name for f in child_model._meta.fields]
+            for record in records:
+                if "created_by" in child_fields:
+                    record["created_by"] = request.user.id
 
             objs = [
                 child_model(**{**record, fk_field: parent_obj}) for record in records
             ]
             child_model.objects.bulk_create(objs)
 
-        # Serialize parent with nested data
-        Serializer = dynamic_serializer(Model, nested_depth=1)
-        return Response(
-            {"data": Serializer(parent_obj).data}, status=status.HTTP_201_CREATED
-        )
+        return Response(model_to_dict(parent_obj), status=status.HTTP_201_CREATED)
 
     @transaction.atomic
     def update(self, request, pk=None, app_label=None, model_name=None):
@@ -272,8 +313,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
                     id__in=existing_ids
                 ).delete()
 
-            Serializer = dynamic_serializer(Model, nested_depth=1)
-            return Response({"data": Serializer(obj).data})
+            return Response(model_to_dict(obj))
 
         except Model.DoesNotExist:
             return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
@@ -292,8 +332,8 @@ class DynamicModelViewSet(viewsets.ViewSet):
             return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
     @action(detail=False, methods=["post"])
-    def get_many(self, request, app_label=None, model_name=None):
-        Model = self.get_model(app_label, model_name)
+    def get_many(self, request, model_name=None):
+        Model = self.get_model(self.app_label, model_name)
         ids = request.data.get("filter", {}).get("id", [])
         queryset = Model.objects.filter(id__in=ids)
         if hasattr(Model, "is_deleted"):
@@ -324,9 +364,6 @@ class DynamicModelViewSet(viewsets.ViewSet):
         Model = self.get_model(app_label, model_name)
         queryset = Model.objects.all()
         fields = [field.name for field in Model._meta.fields]
-        Model = self.get_model(app_label, model_name)
-        queryset = Model.objects.all()
-        fields = [field.name for field in Model._meta.fields]
 
         output = io.StringIO()
         writer = csv.writer(output)
@@ -354,24 +391,23 @@ class DynamicModelViewSet(viewsets.ViewSet):
 
 
 @api_view(["GET"])
-def list_models(request):
-    models = []
-    for model in apps.get_models():
-        app_label = model._meta.app_label
-        model_name = model.__name__
-        models.append({"app_label": app_label, "model_name": model_name})
-    return Response(models)
-
-
-@api_view(["GET"])
-def get_model_schema(request, model_name):
-    app_label = "clothingapp"
+def get_model_schema(request, app_label, model_name):
     Model = get_model(app_label, model_name)
     if not Model:
         return Response({"error": "Invalid model"}, status=400)
 
     fields = []
     for field in Model._meta.fields:
+        if field.name in [
+            # "id",
+            "created_at",
+            "updated_at",
+            "modified_at",
+            "created_by",
+            "updated_by",
+            "modified_by",
+        ]:
+            continue
         field_type = field.get_internal_type()
         is_fk = field.is_relation and hasattr(field, "related_model")
         field_info = {
@@ -379,11 +415,32 @@ def get_model_schema(request, model_name):
             "type": field_type,
             "is_fk": is_fk,
             "related_model": None,
+            "related_name": None,
+            "is_required": field.blank is False and field.null is False,
+            # "is_unique": field.unique,
+            # "default": field.default if field.default is not None else None,
+            # "verbose_name": field.verbose_name,
+            # "help_text": field.help_text,
         }
         if is_fk:
-            field_info["related_model"] = field.related_model._meta.model_name
+            field_info["related_model"] = (
+                f"{field.related_model._meta.app_label}/{field.related_model._meta.model_name}"
+            )
+            field_info["related_name"] = getattr(
+                field.related_model._meta,
+                "verbose_name_field",
+                (
+                    "name"
+                    if "name"
+                    in [f.name for f in field.related_model._meta.get_fields()]
+                    else field.related_model._meta.fields[0].name
+                ),
+            )
+
         fields.append(field_info)
 
-    return Response(
-        {"app_label": app_label, "model_name": model_name, "fields": fields}
-    )
+    return Response({
+        "app_label": app_label,
+        "model_name": model_name,
+        "fields": fields,
+    })
