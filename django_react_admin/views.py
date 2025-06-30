@@ -247,8 +247,8 @@ class DynamicModelViewSet(viewsets.ViewSet):
     @transaction.atomic
     def create(self, request, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
-        data = dict(request.data)
-        files = request.FILES
+        data = dict(request.POST.dict()) if request.POST else dict(request.data)
+        files = request.FILES.dict() if request.FILES else {}
 
         def recursive_create(model, data, parent_obj=None, parent_model=None):
             # Set created_by if exists
@@ -323,8 +323,8 @@ class DynamicModelViewSet(viewsets.ViewSet):
     @transaction.atomic
     def update(self, request, pk=None, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
-        data = dict(request.data)
-        files = request.FILES
+        data = dict(request.POST.dict()) if request.POST else dict(request.data)
+        files = request.FILES.dict() if request.FILES else {}
 
         def save_file_and_get_url(file, folder="uploads"):
             filename = default_storage.save(path.join(folder, file.name), file)
