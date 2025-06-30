@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: django-react-admin
-Version: 0.1.7
+Version: 0.1.8
 Summary: Dynamic Django DRF backend for React-Admin
 Home-page: https://github.com/asmsaifs/django-react-admin
 Author: ASM Saiful Islam Chowdhury

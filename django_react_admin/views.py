@@ -86,8 +86,8 @@ def update_relation(instance, data):
                 value = data.get(field.name, None)
             if value is not None:
                 data[field.name] = field.related_model.objects.get(pk=value)
-            else:
-                data[field.name] = None
+            # else:
+            #     data[field.name] = None
     return data
 
 
@@ -144,7 +144,7 @@ def parse_filters(filters, Model):
         )
         if field and field.get_internal_type() == "UUIDField":
             try:
-                print("UUID value:", value)
+                # print("UUID value:", value)
                 value = UUID(value)  # Validate and convert to UUID
             except (ValueError, TypeError):
                 raise ValueError(f"'{value}' is not a valid UUID.")
@@ -186,10 +186,14 @@ class DynamicModelViewSet(viewsets.ViewSet):
 
     def get_model(self, app_label, model_name):
         model = get_model(app_label, model_name)
-        print("model:", app_label, model_name)
+        # print("model:", app_label, model_name)
         if not model:
             raise Exception("Invalid model")
         return model
+
+    def save_file_and_get_url(self, file, folder="uploads"):
+        filename = default_storage.save(path.join(folder, file.name), file)
+        return default_storage.url(filename)
 
     def list(self, request, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
@@ -324,14 +328,13 @@ class DynamicModelViewSet(viewsets.ViewSet):
     def update(self, request, pk=None, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
         data = dict(request.POST.dict()) if request.POST else dict(request.data)
+        # print("data to update:", data)
         files = request.FILES.dict() if request.FILES else {}
 
-        def save_file_and_get_url(file, folder="uploads"):
-            filename = default_storage.save(path.join(folder, file.name), file)
-            return default_storage.url(filename)
-
         def recursive_update(model, obj, data, parent_obj=None, parent_model=None):
+            # print("Updating model1:", model, "with data1:", data)
             update_relation(model, data)
+            # print("Updating model2:", model, "with data2:", data)
             # Only include children where the child model has FK to the parent model
             children = {}
             parent_data = {}
@@ -366,19 +369,17 @@ class DynamicModelViewSet(viewsets.ViewSet):
                 if fk_field:
                     parent_data[fk_field] = parent_obj
 
-            # Save files and set URL to CharField
-            for field in model._meta.fields:
-                if (
-                    field.get_internal_type() == "CharField"
-                    and files
-                    and field.name in files
-                ):
-                    file_url = save_file_and_get_url(files[field.name])
-                    setattr(obj, field.name, file_url)
-
             # Update parent object
             for k, v in parent_data.items():
-                setattr(obj, k, v)
+                # print("Updating field:", k, "with value:", v)
+                if files and k in files:
+                    file_url = self.save_file_and_get_url(files[k])
+                    # print("Uploaded file URL:", file_url)
+                    setattr(obj, k, file_url)
+                else:
+                    setattr(obj, k, v)
+
+            # print("Saving parent object:", obj.__dict__)
             obj.save()
 
             # Handle children recursively
