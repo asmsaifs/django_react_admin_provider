@@ -13,6 +13,9 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
 
+from os import path
+from django.core.files.storage import default_storage
+
 
 class AdminFullAccess(BasePermission):
     def has_permission(self, request, view):
@@ -217,6 +220,8 @@ class DynamicModelViewSet(viewsets.ViewSet):
             queryset = queryset.filter(parse_filters(filters, Model))
         if hasattr(Model, "is_deleted"):
             queryset = queryset.filter(is_deleted=False)
+        if hasattr(Model, "unit_id") and request.headers.get("Unit-ID"):
+            queryset = queryset.filter(unit_id=request.headers.get("Unit-ID"))
 
         if sort:
             field, order = sort
@@ -243,6 +248,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
     def create(self, request, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
         data = dict(request.data)
+        files = request.FILES
 
         def recursive_create(model, data, parent_obj=None, parent_model=None):
             # Set created_by if exists
@@ -252,6 +258,9 @@ class DynamicModelViewSet(viewsets.ViewSet):
             # Set created_at if exists
             if "created_at" in [f.name for f in model._meta.fields]:
                 data["created_at"] = datetime.utcnow()
+
+            if hasattr(model, "unit_id") and request.headers.get("Unit-ID"):
+                data["unit_id"] = request.headers.get("Unit-ID")
 
             # Update relation fields
             update_relation(model, data)
@@ -275,6 +284,15 @@ class DynamicModelViewSet(viewsets.ViewSet):
 
                 elif not isinstance(v, list):
                     parent_data[k] = v
+
+            # Assign file fields if present
+            for field in model._meta.fields:
+                if (
+                    field.get_internal_type() == "CharField"
+                    and files
+                    and field.name in files
+                ):
+                    data[field.name] = files[field.name]
 
             # If this is a child, set the foreign key to parent_obj
             if parent_obj and parent_model:
@@ -306,6 +324,11 @@ class DynamicModelViewSet(viewsets.ViewSet):
     def update(self, request, pk=None, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
         data = dict(request.data)
+        files = request.FILES
+
+        def save_file_and_get_url(file, folder="uploads"):
+            filename = default_storage.save(path.join(folder, file.name), file)
+            return default_storage.url(filename)
 
         def recursive_update(model, obj, data, parent_obj=None, parent_model=None):
             update_relation(model, data)
@@ -342,6 +365,16 @@ class DynamicModelViewSet(viewsets.ViewSet):
                 fk_field = get_foreign_key_field(model, parent_model)
                 if fk_field:
                     parent_data[fk_field] = parent_obj
+
+            # Save files and set URL to CharField
+            for field in model._meta.fields:
+                if (
+                    field.get_internal_type() == "CharField"
+                    and files
+                    and field.name in files
+                ):
+                    file_url = save_file_and_get_url(files[field.name])
+                    setattr(obj, field.name, file_url)
 
             # Update parent object
             for k, v in parent_data.items():
@@ -390,7 +423,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
                 data["created_at"] = datetime.utcnow()
 
             update_relation(model, data)
-            
+
             # Only include children where the child model has FK to the parent model
             children = {}
             parent_data = {}
@@ -524,6 +557,7 @@ def get_model_schema(request, app_label, model_name):
     for field in Model._meta.fields:
         if field.name in [
             # "id",
+            "unit_id",
             "created_at",
             "updated_at",
             "modified_at",
