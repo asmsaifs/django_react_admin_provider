@@ -1,18 +1,17 @@
 import csv
 import io
-from uuid import UUID
 from datetime import datetime
+from uuid import UUID
 
 from django.apps import apps
 from django.db import transaction
 from django.db.models import Q
 from rest_framework import status, viewsets
-from rest_framework.decorators import action
+from rest_framework.decorators import action, api_view
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.decorators import api_view
 
 
 class AdminFullAccess(BasePermission):
@@ -68,8 +67,20 @@ def model_to_dict(instance, exclude_password=True):
 def update_relation(instance, data):
     for field in instance._meta.fields:
         if field.is_relation:
+            # import pdb; pdb.set_trace()
             # If ForeignKey field, store the related object's ID only
-            value = data.get(field.name, None)
+            if (
+                data.get(field.name)
+                and field.foreign_related_fields[0].get_internal_type() == "UUIDField"
+            ):
+                # print("UUID value:", data.get(field.name))
+                # import pdb; pdb.set_trace()
+                if isinstance(data.get(field.name), str):
+                    value = UUID(data.get(field.name))
+                else:
+                    value = UUID(data.get(field.name).id)
+            else:
+                value = data.get(field.name, None)
             if value is not None:
                 data[field.name] = field.related_model.objects.get(pk=value)
             else:
@@ -120,14 +131,17 @@ def parse_filters(filters, Model):
             except Exception:
                 pass
 
-        if isinstance(value, list) and len(value) == 1:
+        if isinstance(value, list):
             # If the value is a single-item list, extract the item
             value = value[0]
 
         # Check if the field is a UUIDField
-        field = next((f for f in Model._meta.fields if f.name == key.split("|")[0]), None)
+        field = next(
+            (f for f in Model._meta.fields if f.name == key.split("|")[0]), None
+        )
         if field and field.get_internal_type() == "UUIDField":
             try:
+                print("UUID value:", value)
                 value = UUID(value)  # Validate and convert to UUID
             except (ValueError, TypeError):
                 raise ValueError(f"'{value}' is not a valid UUID.")
@@ -193,7 +207,9 @@ class DynamicModelViewSet(viewsets.ViewSet):
             sort = [Model._meta.pk.name or Model._meta.fields[0].name, "ASC"]
 
         if not isinstance(sort, list) or len(sort) != 2:
-            return Response({"error": "Invalid sort parameter"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Invalid sort parameter"}, status=status.HTTP_400_BAD_REQUEST
+            )
         range_ = eval(request.GET.dict().get("range", "[0, 9]"))
 
         queryset = Model.objects.all()
@@ -228,44 +244,62 @@ class DynamicModelViewSet(viewsets.ViewSet):
         Model = self.get_model(app_label, model_name)
         data = dict(request.data)
 
-        if "created_by" in [f.name for f in Model._meta.fields]:
-            data["created_by"] = request.user.id
+        def recursive_create(model, data, parent_obj=None, parent_model=None):
+            # Set created_by if exists
+            if "created_by" in [f.name for f in model._meta.fields]:
+                data["created_by"] = request.user.id
 
-        data["created_at"] = datetime.utcnow()
-        update_relation(Model, data)
+            # Set created_at if exists
+            if "created_at" in [f.name for f in model._meta.fields]:
+                data["created_at"] = datetime.utcnow()
 
-        # Detect child tables (list-type fields)
-        children = {k: v for k, v in data.items() if isinstance(v, list)}
-        parent_data = {k: v for k, v in data.items() if not isinstance(v, list)}
-        # Create parent
-        if "created_at" in [f.name for f in Model._meta.fields]:
-            parent_data["created_at"] = datetime.utcnow()
+            # Update relation fields
+            update_relation(model, data)
 
-        parent_obj = Model.objects.create(**parent_data)
+            # Detect child tables (list-type fields)
+            # Only include children where the child model has FK to the parent model
+            children = {}
+            parent_data = {}
+            for k, v in data.items():
+                if isinstance(v, list):
+                    try:
+                        child_model = self.get_model(app_label, k)
+                        fk_field = get_foreign_key_field(child_model, model)
+                        if fk_field:
+                            children[k] = v
+                        else:
+                            parent_data[k] = v
+                    except Exception:
+                        parent_data[k] = v
+                        continue
 
-        # Handle children
-        for child_key, records in children.items():
-            # infer child model
-            try:
-                child_model = get_model(app_label, child_key)
-            except Exception:
-                continue
+                elif not isinstance(v, list):
+                    parent_data[k] = v
 
-            fk_field = get_foreign_key_field(child_model, Model)
-            if not fk_field:
-                continue
+            # If this is a child, set the foreign key to parent_obj
+            if parent_obj and parent_model:
+                fk_field = get_foreign_key_field(model, parent_model)
+                if fk_field:
+                    parent_data[fk_field] = parent_obj
 
-            # Set created_by for children if field exists
-            child_fields = [f.name for f in child_model._meta.fields]
-            for record in records:
-                if "created_by" in child_fields:
-                    record["created_by"] = request.user.id
+            # Create parent
+            obj = model.objects.create(**parent_data)
 
-            objs = [
-                child_model(**{**record, fk_field: parent_obj}) for record in records
-            ]
-            child_model.objects.bulk_create(objs)
+            # Handle children recursively
+            for child_key, records in children.items():
+                try:
+                    child_model = self.get_model(app_label, child_key)
+                except Exception:
+                    continue
+                # Only process if child_model has FK to current model
+                fk_field = get_foreign_key_field(child_model, model)
+                if not fk_field:
+                    continue
+                for record in records:
+                    recursive_create(child_model, record, obj, model)
+            return obj
 
+        parent_obj = recursive_create(Model, data)
         return Response(model_to_dict(parent_obj), status=status.HTTP_201_CREATED)
 
     @transaction.atomic
@@ -273,48 +307,132 @@ class DynamicModelViewSet(viewsets.ViewSet):
         Model = self.get_model(app_label, model_name)
         data = dict(request.data)
 
-        update_relation(Model, data)
+        def recursive_update(model, obj, data, parent_obj=None, parent_model=None):
+            update_relation(model, data)
+            # Only include children where the child model has FK to the parent model
+            children = {}
+            parent_data = {}
+            for k, v in data.items():
+                if isinstance(v, list):
+                    try:
+                        child_model = self.get_model(app_label, k)
+                        fk_field = get_foreign_key_field(child_model, model)
+                        if fk_field:
+                            children[k] = v
+                        else:
+                            parent_data[k] = v
+                    except Exception:
+                        parent_data[k] = v
+                        continue
 
-        children = {k: v for k, v in data.items() if isinstance(v, list)}
-        parent_data = {k: v for k, v in data.items() if not isinstance(v, list)}
+                elif not isinstance(v, list):
+                    parent_data[k] = v
 
-        try:
-            obj = Model.objects.get(pk=pk)
-
+            # Remove created_at if present
             if "created_at" in parent_data:
                 del parent_data["created_at"]
-            if "updated_at" in [f.name for f in Model._meta.fields]:
+            if "created_by" in parent_data:
+                del parent_data["created_by"]
+            # Update updated_at if exists
+            if "updated_at" in [f.name for f in model._meta.fields]:
                 parent_data["updated_at"] = datetime.utcnow()
 
+            # If this is a child, set the foreign key to parent_obj
+            if parent_obj and parent_model:
+                fk_field = get_foreign_key_field(model, parent_model)
+                if fk_field:
+                    parent_data[fk_field] = parent_obj
+
+            # Update parent object
             for k, v in parent_data.items():
                 setattr(obj, k, v)
             obj.save()
 
-            # Handle children
+            # Handle children recursively
             for child_key, records in children.items():
-                child_model = get_model(app_label, child_key)
-                # fk_field = f"{model_name.lower()}_id"
-                fk_field = get_foreign_key_field(child_model, Model)
+                child_model = self.get_model(app_label, child_key)
+                fk_field = get_foreign_key_field(child_model, model)
                 if not fk_field:
                     continue
 
                 existing_ids = []
+                child_fields = [f.name for f in child_model._meta.fields]
                 for item in records:
                     item[fk_field] = obj
-                    if "id" in item:
-                        existing_ids.append(item["id"])
-                        child_model.objects.filter(id=item["id"]).update(**item)
-                    else:
-                        existing_ids.append(child_model.objects.create(**item).id)
+                    if "updated_by" in child_fields:
+                        item["updated_by"] = request.user.id
 
-                print("existing_ids ->", existing_ids)
+                    if "id" in item and item["id"]:
+                        try:
+                            child_obj = child_model.objects.get(id=item["id"])
+                            recursive_update(child_model, child_obj, item, obj, model)
+                            existing_ids.append(child_obj.id)
+                        except child_model.DoesNotExist:
+                            # If not found, create new
+                            new_child = recursive_create(child_model, item, obj, model)
+                            existing_ids.append(new_child.id)
+                    else:
+                        new_child = recursive_create(child_model, item, obj, model)
+                        existing_ids.append(new_child.id)
+
                 # Delete removed children
                 child_model.objects.filter(**{fk_field: obj.id}).exclude(
                     id__in=existing_ids
                 ).delete()
 
-            return Response(model_to_dict(obj))
+        def recursive_create(model, data, parent_obj=None, parent_model=None):
+            # Set created_by if exists
+            if "created_by" in [f.name for f in model._meta.fields]:
+                data["created_by"] = request.user.id
 
+            # Set created_at if exists
+            if "created_at" in [f.name for f in model._meta.fields]:
+                data["created_at"] = datetime.utcnow()
+
+            update_relation(model, data)
+            
+            # Only include children where the child model has FK to the parent model
+            children = {}
+            parent_data = {}
+            for k, v in data.items():
+                if isinstance(v, list):
+                    try:
+                        child_model = self.get_model(app_label, k)
+                        fk_field = get_foreign_key_field(child_model, model)
+                        if fk_field:
+                            children[k] = v
+                        else:
+                            parent_data[k] = v
+                    except Exception:
+                        parent_data[k] = v
+                        continue
+
+                elif not isinstance(v, list):
+                    parent_data[k] = v
+
+            if parent_obj and parent_model:
+                fk_field = get_foreign_key_field(model, parent_model)
+                if fk_field:
+                    parent_data[fk_field] = parent_obj
+
+            obj = model.objects.create(**parent_data)
+
+            for child_key, records in children.items():
+                try:
+                    child_model = self.get_model(app_label, child_key)
+                except Exception:
+                    continue
+                fk_field = get_foreign_key_field(child_model, model)
+                if not fk_field:
+                    continue
+                for record in records:
+                    recursive_create(child_model, record, obj, model)
+            return obj
+
+        try:
+            obj = Model.objects.get(pk=pk)
+            recursive_update(Model, obj, data)
+            return Response(model_to_dict(obj))
         except Model.DoesNotExist:
             return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -327,37 +445,43 @@ class DynamicModelViewSet(viewsets.ViewSet):
                 obj.save()
             else:
                 obj.delete()
-            return Response({"data": model_to_dict(obj)})
+            return Response(model_to_dict(obj))
         except Model.DoesNotExist:
             return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    @action(detail=False, methods=["post"])
-    def get_many(self, request, model_name=None):
-        Model = self.get_model(self.app_label, model_name)
-        ids = request.data.get("filter", {}).get("id", [])
+    @action(detail=False, methods=["get"])
+    def get_many(self, request, app_label=None, model_name=None):
+        Model = self.get_model(app_label, model_name)
+        filters = eval(request.GET.dict().get("filter", "{}"))
+        # ids = request.data.get("filter", {}).get("id", [])
+        ids = filters.get("id", [])
         queryset = Model.objects.filter(id__in=ids)
         if hasattr(Model, "is_deleted"):
             queryset = queryset.filter(is_deleted=False)
         data = [model_to_dict(obj) for obj in queryset]
-        return Response({"data": data})
+        return Response(data)
 
-    @action(detail=False, methods=["post"])
+    @action(detail=False, methods=["get"])
     def update_many(self, request, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
-        ids = request.data.get("filter", {}).get("id", [])
+        filters = eval(request.GET.dict().get("filter", "{}"))
+        # ids = request.data.get("filter", {}).get("id", [])
+        ids = filters.get("id", [])
         update_data = request.data.get("data", {})
         Model.objects.filter(id__in=ids).update(**update_data)
-        return Response({"data": ids})
+        return Response(ids)
 
-    @action(detail=False, methods=["post"])
+    @action(detail=False, methods=["get"])
     def delete_many(self, request, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
-        ids = request.data.get("filter", {}).get("id", [])
+        filters = eval(request.GET.dict().get("filter", "{}"))
+        # ids = request.data.get("filter", {}).get("id", [])
+        ids = filters.get("id", [])
         if hasattr(Model, "is_deleted"):
             Model.objects.filter(id__in=ids).update(is_deleted=True)
         else:
             Model.objects.filter(id__in=ids).delete()
-        return Response({"data": ids})
+        return Response(ids)
 
     @action(detail=False, methods=["get"])
     def export_data(self, request, app_label=None, model_name=None):
@@ -439,8 +563,10 @@ def get_model_schema(request, app_label, model_name):
 
         fields.append(field_info)
 
-    return Response({
-        "app_label": app_label,
-        "model_name": model_name,
-        "fields": fields,
-    })
+    return Response(
+        {
+            "app_label": app_label,
+            "model_name": model_name,
+            "fields": fields,
+        }
+    )
