@@ -228,9 +228,10 @@ class DynamicModelViewSet(viewsets.ViewSet):
                 field = f"-{field}"
             queryset = queryset.order_by(field)
 
+        total_count = queryset.count()
         queryset = queryset[range_[0] : range_[1] + 1]
         response = Response([model_to_dict(obj) for obj in queryset])
-        response["Content-Range"] = f"{range_[0]}-{range_[1]}/{queryset.count()}"
+        response["Content-Range"] = f"{range_[0]}-{range_[1]}/{total_count}"
         return response
 
     def retrieve(self, request, pk=None, app_label=None, model_name=None):
