@@ -555,6 +555,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
         """
         Model = self.get_model(app_label, model_name)
         items = request.data.get("items", [])
+        update_relation(Model, items)
         if not isinstance(items, list) or not items:
             return Response(
                 {"error": "No items provided"}, status=status.HTTP_400_BAD_REQUEST
