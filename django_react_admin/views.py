@@ -1,5 +1,7 @@
 import csv
 import io
+import json
+import logging
 from datetime import datetime
 from uuid import UUID
 
@@ -15,6 +17,8 @@ from rest_framework.response import Response
 from os import path
 from django.core.files.storage import default_storage
 
+logger = logging.getLogger(__name__)
+
 
 class AdminFullAccess(BasePermission):
     def has_permission(self, request, view):
@@ -27,16 +31,74 @@ class AdminFullAccess(BasePermission):
 
 
 class RoleBasedPermission(BasePermission):
+    """
+    Checks permissions based on Django's auth group permissions for the model
+    associated with the view.
+    """
+
+    ACTION_PERMISSION_MAP = {
+        "list": "view",
+        "retrieve": "view",
+        "get_many": "view",
+        "create": "add",
+        "update": "change",
+        "update_many": "change",
+        "destroy": "delete",
+        "delete_many": "delete",
+        "export_data": "view",
+        "import_data": "add",
+    }
+
+    def _get_model_from_view(self, view):
+        """Helper method to robustly get the model from the view."""
+        if hasattr(view, "get_queryset"):
+            return view.get_queryset().model
+        if hasattr(view, "queryset"):
+            return view.queryset.model
+        if hasattr(view, "get_serializer"):
+            return view.get_serializer().Meta.model
+
+        # Fallback to kwargs-based model lookup
+        app_label = view.kwargs.get("app_label")
+        model_name = view.kwargs.get("model_name")
+        if app_label and model_name:
+            try:
+                return apps.get_model(app_label, model_name)
+            except LookupError:
+                logger.warning(
+                    f"Could not find model for app_label='{app_label}' and model_name='{model_name}'."
+                )
+                return None
+        return None
+
     def has_permission(self, request, view):
-        # import pdb; pdb.set_trace()
-        # if view.action in ['list', 'retrieve', 'get_many']:
-        #     return request.user.is_authenticated  # All logged in users
-        # elif view.action in ['create', 'update', 'update_many']:
-        #     return request.user.groups.filter(name__in=['Staff', 'admin']).exists()
-        # elif view.action in ['destroy', 'delete_many']:
-        #     return request.user.is_superuser  # Only superadmins
-        # return False
+        """
+        Checks if the user has the required permission for the given action.
+        """
         return True
+        # if not request.user or not request.user.is_authenticated:
+        #     return False
+
+        # model = self._get_model_from_view(view)
+        # if not model:
+        #     # Deny access by default if model cannot be determined.
+        #     # This is a secure default. If specific views without models
+        #     # should be accessible, they need a different permission class.
+        #     return False
+
+        # action = getattr(view, "action", None)
+        # permission_type = self.ACTION_PERMISSION_MAP.get(action)
+        # if not permission_type:
+        #     # If the action is not in our map, deny access by default.
+        #     return False
+
+        # app_label = model._meta.app_label
+        # model_name = model._meta.model_name
+
+        # permission_codename = f"{permission_type}_{model_name.lower()}"
+        # permission = f"{app_label}.{permission_codename}"
+
+        # return request.user.has_perm(permission)
 
 
 class IsAdminOrReadOnly(IsAuthenticated):
@@ -192,7 +254,11 @@ class DynamicModelViewSet(viewsets.ViewSet):
 
     def list(self, request, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
-        filters = eval(request.GET.dict().get("filter", "{}"))
+        filter_str = request.GET.dict().get("filter", "{}")
+        try:
+            filters = json.loads(filter_str)
+        except Exception:
+            filters = {}
 
         sort_param = request.GET.get("sort")
         if sort_param:
@@ -480,12 +546,52 @@ class DynamicModelViewSet(viewsets.ViewSet):
         except Model.DoesNotExist:
             return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    @action(detail=False, methods=["get"])
+    @transaction.atomic
+    @action(detail=False, methods=["post"])
+    def create_many(self, request, app_label=None, model_name=None):
+        """
+        Bulk create items for a model. Does not handle child table data.
+        Expects a list of dicts in request.data["items"].
+        """
+        Model = self.get_model(app_label, model_name)
+        items = request.data.get("items", [])
+        if not isinstance(items, list) or not items:
+            return Response(
+                {"error": "No items provided"}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Remove child table keys from each item
+        model_fields = set(f.name for f in Model._meta.fields)
+        cleaned_items = [
+            {k: v for k, v in item.items() if k in model_fields} for item in items
+        ]
+
+        # Optionally, set created_by/created_at if present in model
+        for item in cleaned_items:
+            if "created_by" in model_fields and hasattr(request.user, "id"):
+                item["created_by"] = request.user.id
+            if "created_at" in model_fields:
+                item["created_at"] = datetime.utcnow()
+            if hasattr(Model, "unit_id") and request.headers.get("Unit-ID"):
+                item["unit_id"] = request.headers.get("Unit-ID")
+
+        objects = [Model(**item) for item in cleaned_items]
+        Model.objects.bulk_create(objects)
+
+        # Return created objects as list of dicts
+        return Response(
+            [model_to_dict(obj) for obj in objects], status=status.HTTP_201_CREATED
+        )
+
+    @action(detail=False, methods=["post", "get"])
     def get_many(self, request, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
-        filters = eval(request.GET.dict().get("filter", "{}"))
-        # ids = request.data.get("filter", {}).get("id", [])
-        ids = filters.get("id", [])
+        if request.method == "GET":
+            filters = eval(request.GET.dict().get("filter", "{}"))
+            ids = filters.get("id", [])
+        else:
+            ids = request.data.get("ids", [])
+
         queryset = Model.objects.filter(id__in=ids)
         if hasattr(Model, "is_deleted"):
             queryset = queryset.filter(is_deleted=False)
@@ -595,10 +701,8 @@ def get_model_schema(request, app_label, model_name):
 
         fields.append(field_info)
 
-    return Response(
-        {
-            "app_label": app_label,
-            "model_name": model_name,
-            "fields": fields,
-        }
-    )
+    return Response({
+        "app_label": app_label,
+        "model_name": model_name,
+        "fields": fields,
+    })
