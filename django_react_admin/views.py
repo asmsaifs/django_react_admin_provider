@@ -13,6 +13,8 @@ from rest_framework.decorators import action, api_view
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.response import Response
+from django.core.exceptions import ValidationError
+from django.db import IntegrityError
 
 from os import path
 from django.core.files.storage import default_storage
@@ -365,7 +367,13 @@ class DynamicModelViewSet(viewsets.ViewSet):
                     parent_data[fk_field] = parent_obj
 
             # Create parent
-            obj = model.objects.create(**parent_data)
+            try:
+                obj = model(**parent_data)
+                obj.full_clean()  # Validate model before creating
+                obj.save()
+                # obj = model.objects.create(**parent_data)
+            except Exception as e:
+                raise e
 
             # Handle children recursively
             for child_key, records in children.items():
@@ -381,7 +389,16 @@ class DynamicModelViewSet(viewsets.ViewSet):
                     recursive_create(child_model, record, obj, model)
             return obj
 
-        parent_obj = recursive_create(Model, data)
+        try:
+            parent_obj = recursive_create(Model, data)
+        except ValidationError as e:
+            return Response(e.message_dict, status=status.HTTP_400_BAD_REQUEST)
+        except IntegrityError as e:
+            # Example for unique constraint violation
+            return Response(
+                {"non_field_errors": [str(e)]}, status=status.HTTP_400_BAD_REQUEST
+            )
+
         return Response(model_to_dict(parent_obj), status=status.HTTP_201_CREATED)
 
     @transaction.atomic
@@ -443,7 +460,12 @@ class DynamicModelViewSet(viewsets.ViewSet):
             # Update parent object
             for k, v in parent_data.items():
                 setattr(obj, k, v)
-            obj.save()
+
+            try:
+                obj.full_clean()  # Validate model before saving
+                obj.save()
+            except Exception as e:
+                raise e
 
             # Handle children recursively
             for child_key, records in children.items():
@@ -512,7 +534,18 @@ class DynamicModelViewSet(viewsets.ViewSet):
                 if fk_field:
                     parent_data[fk_field] = parent_obj
 
-            obj = model.objects.create(**parent_data)
+            try:
+                obj = model(**parent_data)
+                obj.full_clean()  # Validate model before creating
+                obj.save()  # Validate model before creating
+                # obj = model.objects.create(**parent_data)
+            except ValidationError as e:
+                return Response(e.message_dict, status=status.HTTP_400_BAD_REQUEST)
+            except IntegrityError as e:
+                # Example for unique constraint violation
+                return Response(
+                    {"non_field_errors": [str(e)]}, status=status.HTTP_400_BAD_REQUEST
+                )
 
             for child_key, records in children.items():
                 try:
@@ -530,6 +563,13 @@ class DynamicModelViewSet(viewsets.ViewSet):
             obj = Model.objects.get(pk=pk)
             recursive_update(Model, obj, data)
             return Response(model_to_dict(obj))
+        except ValidationError as e:
+            return Response(e.message_dict, status=status.HTTP_400_BAD_REQUEST)
+        except IntegrityError as e:
+            # Example for unique constraint violation
+            return Response(
+                {"non_field_errors": [str(e)]}, status=status.HTTP_400_BAD_REQUEST
+            )
         except Model.DoesNotExist:
             return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -555,7 +595,6 @@ class DynamicModelViewSet(viewsets.ViewSet):
         """
         Model = self.get_model(app_label, model_name)
         items = request.data.get("items", [])
-        update_relation(Model, items)
         if not isinstance(items, list) or not items:
             return Response(
                 {"error": "No items provided"}, status=status.HTTP_400_BAD_REQUEST
@@ -575,9 +614,20 @@ class DynamicModelViewSet(viewsets.ViewSet):
                 item["created_at"] = datetime.utcnow()
             if hasattr(Model, "unit_id") and request.headers.get("Unit-ID"):
                 item["unit_id"] = request.headers.get("Unit-ID")
+            update_relation(Model, item)
 
         objects = [Model(**item) for item in cleaned_items]
-        Model.objects.bulk_create(objects)
+
+        try:
+            Model.objects.full_clean()  # Validate model before creating
+            Model.objects.bulk_create(objects)
+        except ValidationError as e:
+            return Response(e.message_dict, status=status.HTTP_400_BAD_REQUEST)
+        except IntegrityError as e:
+            # Example for unique constraint violation
+            return Response(
+                {"non_field_errors": [str(e)]}, status=status.HTTP_400_BAD_REQUEST
+            )
 
         # Return created objects as list of dicts
         return Response(
@@ -702,8 +752,10 @@ def get_model_schema(request, app_label, model_name):
 
         fields.append(field_info)
 
-    return Response({
-        "app_label": app_label,
-        "model_name": model_name,
-        "fields": fields,
-    })
+    return Response(
+        {
+            "app_label": app_label,
+            "model_name": model_name,
+            "fields": fields,
+        }
+    )
