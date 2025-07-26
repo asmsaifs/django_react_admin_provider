@@ -619,7 +619,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
         objects = [Model(**item) for item in cleaned_items]
 
         try:
-            Model.objects.full_clean()  # Validate model before creating
+            # Model.objects.full_clean()  # Validate model before creating
             Model.objects.bulk_create(objects)
         except ValidationError as e:
             return Response(e.message_dict, status=status.HTTP_400_BAD_REQUEST)
