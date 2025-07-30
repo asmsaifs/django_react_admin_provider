@@ -216,10 +216,30 @@ def parse_filters(filters, Model):
             field, op = key.split("|op=")
             if op in ("like", "ilike"):
                 q &= Q(**{f"{field}__icontains": value})
-            elif op == ">":
+            elif op == "gt":
                 q &= Q(**{f"{field}__gt": value})
-            elif op == "<":
+            elif op == "lt":
                 q &= Q(**{f"{field}__lt": value})
+            elif op == "not_eq":
+                q &= ~Q(**{field: value})
+            elif op == "in":
+                if isinstance(value, list):
+                    q &= Q(**{f"{field}__in": value})
+                else:
+                    raise ValueError("Value for 'in' operation must be a list.")
+            elif op == "not_in":
+                if isinstance(value, list):
+                    q &= ~Q(**{f"{field}__in": value})
+                else:
+                    raise ValueError("Value for 'not_in' operation must be a list.")
+            elif op == "isnull":
+                if value:
+                    q &= Q(**{f"{field}__isnull": True})
+                else:
+                    q &= Q(**{f"{field}__isnull": False})
+            else:
+                raise ValueError(f"Unsupported operation '{op}' for field '{field}'.")
+
         elif key == "q":
             search = Q()
             for field in Model._meta.fields:
@@ -752,10 +772,8 @@ def get_model_schema(request, app_label, model_name):
 
         fields.append(field_info)
 
-    return Response(
-        {
-            "app_label": app_label,
-            "model_name": model_name,
-            "fields": fields,
-        }
-    )
+    return Response({
+        "app_label": app_label,
+        "model_name": model_name,
+        "fields": fields,
+    })
