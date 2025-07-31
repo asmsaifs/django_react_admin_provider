@@ -6,7 +6,7 @@ setup(
     packages=find_packages(),
     include_package_data=True,
     install_requires=[
-        "Django>=3.2",
+        "Django>=3.3",
         "djangorestframework",
     ],
     description="Dynamic Django DRF backend for React-Admin",

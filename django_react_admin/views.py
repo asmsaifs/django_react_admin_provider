@@ -112,8 +112,10 @@ class IsAdminOrReadOnly(IsAuthenticated):
         return True
 
 
-def model_to_dict(instance, exclude_password=True):
+def model_to_dict(instance, exclude_password=True, embed=None):
     data = {}
+    embed = embed or []
+
     for field in instance._meta.fields:
         # print("field:", field)
         value = getattr(instance, field.name)
@@ -123,6 +125,16 @@ def model_to_dict(instance, exclude_password=True):
             # If ForeignKey field, store the related object's ID only
             if value is not None:
                 data[field.name] = value.pk
+
+                # Check if this field should be embedded
+                if field.name in embed:
+                    # Use the field name without '_id' suffix for the embedded object
+                    embed_key = (
+                        field.name.replace("_id", "")
+                        if field.name.endswith("_id")
+                        else field.name
+                    )
+                    data[embed_key] = model_to_dict(value, exclude_password)
             else:
                 data[field.name] = None
         else:
@@ -207,7 +219,7 @@ def parse_filters(filters, Model):
         )
         if field and field.get_internal_type() == "UUIDField":
             try:
-                print("UUID value:", value)
+                # print("UUID value:", value)
                 value = UUID(value)  # Validate and convert to UUID
             except (ValueError, TypeError):
                 raise ValueError(f"'{value}' is not a valid UUID.")
@@ -261,6 +273,50 @@ def get_foreign_key_field(child_model, parent_model):
     return None
 
 
+def parse_meta_embed(meta_str):
+    """
+    Parse meta parameter to extract embed information.
+    Expected format: {"embed": ["author", "category"]} or {"embed": "author"}
+    """
+    if not meta_str:
+        return []
+
+    try:
+        meta = json.loads(meta_str)
+        embed = meta.get("embed", [])
+
+        # Handle both string and list formats
+        if isinstance(embed, str):
+            return [embed]
+        elif isinstance(embed, list):
+            return embed
+        else:
+            return []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def get_embed_fields(Model, embed_list):
+    """
+    Validate and return valid embed fields for the model.
+    Only return fields that are actual ForeignKey fields in the model.
+    """
+    valid_embeds = []
+    model_fields = {f.name: f for f in Model._meta.fields}
+
+    for embed_field in embed_list:
+        # Handle both 'author' and 'author_id' formats
+        field_name = embed_field
+        if not field_name.endswith("_id"):
+            field_name = f"{embed_field}_id"
+
+        field = model_fields.get(field_name)
+        if field and field.is_relation:
+            valid_embeds.append(field_name)
+
+    return valid_embeds
+
+
 class DynamicModelViewSet(viewsets.ViewSet):
     # permission_classes = [IsAdminOrReadOnly]
     permission_classes = [RoleBasedPermission]
@@ -269,7 +325,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
 
     def get_model(self, app_label, model_name):
         model = get_model(app_label, model_name)
-        print("model:", app_label, model_name)
+        # print("model:", app_label, model_name)
         if not model:
             raise Exception("Invalid model")
         return model
@@ -281,6 +337,11 @@ class DynamicModelViewSet(viewsets.ViewSet):
             filters = json.loads(filter_str)
         except Exception:
             filters = {}
+
+        # Parse meta parameter for embed functionality
+        meta_str = request.GET.dict().get("meta", "{}")
+        embed_list = parse_meta_embed(meta_str)
+        valid_embeds = get_embed_fields(Model, embed_list)
 
         sort_param = request.GET.get("sort")
         if sort_param:
@@ -303,6 +364,16 @@ class DynamicModelViewSet(viewsets.ViewSet):
         range_ = eval(request.GET.dict().get("range", "[0, 9]"))
 
         queryset = Model.objects.all()
+
+        # Add select_related for embedded fields to optimize queries
+        if valid_embeds:
+            select_related_fields = []
+            for embed_field in valid_embeds:
+                # Remove '_id' suffix to get the relation name
+                relation_name = embed_field.replace("_id", "")
+                select_related_fields.append(relation_name)
+            queryset = queryset.select_related(*select_related_fields)
+
         if filters:
             queryset = queryset.filter(parse_filters(filters, Model))
         if hasattr(Model, "is_deleted"):
@@ -318,15 +389,32 @@ class DynamicModelViewSet(viewsets.ViewSet):
 
         total_count = queryset.count()
         queryset = queryset[range_[0] : range_[1] + 1]
-        response = Response([model_to_dict(obj) for obj in queryset])
+        response = Response([
+            model_to_dict(obj, embed=valid_embeds) for obj in queryset
+        ])
         response["Content-Range"] = f"{range_[0]}-{range_[1]}/{total_count}"
         return response
 
     def retrieve(self, request, pk=None, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
+
+        # Parse meta parameter for embed functionality
+        meta_str = request.GET.dict().get("meta", "{}")
+        embed_list = parse_meta_embed(meta_str)
+        valid_embeds = get_embed_fields(Model, embed_list)
+
         try:
-            obj = Model.objects.get(pk=pk)
-            return Response(model_to_dict(obj))
+            queryset = Model.objects.all()
+
+            # Add select_related for embedded fields to optimize queries
+            if valid_embeds:
+                select_related_fields = []
+                for embed_field in valid_embeds:
+                    select_related_fields.append(embed_field)
+                queryset = queryset.select_related(*select_related_fields)
+
+            obj = queryset.get(pk=pk)
+            return Response(model_to_dict(obj, embed=valid_embeds))
         except Model.DoesNotExist:
             return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
@@ -657,6 +745,12 @@ class DynamicModelViewSet(viewsets.ViewSet):
     @action(detail=False, methods=["post", "get"])
     def get_many(self, request, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
+
+        # Parse meta parameter for embed functionality
+        meta_str = request.GET.dict().get("meta", "{}")
+        embed_list = parse_meta_embed(meta_str)
+        valid_embeds = get_embed_fields(Model, embed_list)
+
         if request.method == "GET":
             filters = eval(request.GET.dict().get("filter", "{}"))
             ids = filters.get("id", [])
@@ -664,9 +758,19 @@ class DynamicModelViewSet(viewsets.ViewSet):
             ids = request.data.get("ids", [])
 
         queryset = Model.objects.filter(id__in=ids)
+
+        # Add select_related for embedded fields to optimize queries
+        if valid_embeds:
+            select_related_fields = []
+            for embed_field in valid_embeds:
+                # Remove '_id' suffix to get the relation name
+                relation_name = embed_field.replace("_id", "")
+                select_related_fields.append(relation_name)
+            queryset = queryset.select_related(*select_related_fields)
+
         if hasattr(Model, "is_deleted"):
             queryset = queryset.filter(is_deleted=False)
-        data = [model_to_dict(obj) for obj in queryset]
+        data = [model_to_dict(obj, embed=valid_embeds) for obj in queryset]
         return Response(data)
 
     @action(detail=False, methods=["get"])
