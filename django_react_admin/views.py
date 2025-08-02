@@ -147,6 +147,7 @@ def update_relation(instance, data):
         if field.is_relation:
             # import pdb; pdb.set_trace()
             # If ForeignKey field, store the related object's ID only
+            value = None
             if (
                 data.get(field.name)
                 and field.foreign_related_fields[0].get_internal_type() == "UUIDField"
@@ -157,12 +158,13 @@ def update_relation(instance, data):
                     value = UUID(data.get(field.name))
                 else:
                     value = UUID(data.get(field.name).id)
-            else:
-                value = data.get(field.name, None)
+            elif data.get(field.name):
+                value = data[field.name]
+            # import pdb; pdb.set_trace()
             if value is not None:
                 data[field.name] = field.related_model.objects.get(pk=value)
-            else:
-                data[field.name] = None
+            # else:
+            #     data[field.name] = None
     return data
 
 
@@ -330,6 +332,11 @@ class DynamicModelViewSet(viewsets.ViewSet):
             raise Exception("Invalid model")
         return model
 
+    @staticmethod
+    def save_file_and_get_url(file, folder="uploads"):
+        default_storage.save(path.join(folder, file.name), file)
+        return f"{folder}/{file.name}"
+
     def list(self, request, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
         filter_str = request.GET.dict().get("filter", "{}")
@@ -370,15 +377,19 @@ class DynamicModelViewSet(viewsets.ViewSet):
             select_related_fields = []
             for embed_field in valid_embeds:
                 # Remove '_id' suffix to get the relation name
-                relation_name = embed_field.replace("_id", "")
-                select_related_fields.append(relation_name)
+                # relation_name = embed_field.replace("_id", "")
+                select_related_fields.append(embed_field)
             queryset = queryset.select_related(*select_related_fields)
 
         if filters:
             queryset = queryset.filter(parse_filters(filters, Model))
         if hasattr(Model, "is_deleted"):
             queryset = queryset.filter(is_deleted=False)
-        if hasattr(Model, "unit_id") and request.headers.get("Unit-ID"):
+        if (
+            hasattr(Model, "unit_id")
+            and "unit_id" not in filters
+            and request.headers.get("Unit-ID")
+        ):
             queryset = queryset.filter(unit_id=request.headers.get("Unit-ID"))
 
         if sort:
@@ -451,22 +462,25 @@ class DynamicModelViewSet(viewsets.ViewSet):
                         if fk_field:
                             children[k] = v
                         else:
-                            parent_data[k] = v
+                            if v is None or "blob:" not in str(v):
+                                parent_data[k] = v
+
                     except Exception:
                         parent_data[k] = v
                         continue
 
                 elif not isinstance(v, list):
-                    parent_data[k] = v
+                    if v is None or "blob:" not in str(v):
+                        parent_data[k] = v
 
             # Assign file fields if present
             for field in model._meta.fields:
-                if (
-                    field.get_internal_type() == "CharField"
-                    and files
-                    and field.name in files
-                ):
-                    data[field.name] = files[field.name]
+                if files and field.name in files:
+                    file_url = self.save_file_and_get_url(files[field.name])
+                    if field.get_internal_type() == "JSONField":
+                        file_url = {"src": file_url, "title": files[field.name].name}
+
+                    data[field.name] = file_url
 
             # If this is a child, set the foreign key to parent_obj
             if parent_obj and parent_model:
@@ -515,10 +529,6 @@ class DynamicModelViewSet(viewsets.ViewSet):
         data = dict(request.POST.dict()) if request.POST else dict(request.data)
         files = request.FILES.dict() if request.FILES else {}
 
-        def save_file_and_get_url(file, folder="uploads"):
-            filename = default_storage.save(path.join(folder, file.name), file)
-            return default_storage.url(filename)
-
         def recursive_update(model, obj, data, parent_obj=None, parent_model=None):
             update_relation(model, data)
             # Only include children where the child model has FK to the parent model
@@ -532,7 +542,9 @@ class DynamicModelViewSet(viewsets.ViewSet):
                         if fk_field:
                             children[k] = v
                         else:
-                            parent_data[k] = v
+                            if v is None or "blob:" not in str(v):
+                                parent_data[k] = v
+
                     except Exception:
                         parent_data[k] = v
                         continue
@@ -555,25 +567,72 @@ class DynamicModelViewSet(viewsets.ViewSet):
                 if fk_field:
                     parent_data[fk_field] = parent_obj
 
-            # Save files and set URL to CharField
-            for field in model._meta.fields:
-                if (
-                    field.get_internal_type() == "CharField"
-                    and files
-                    and field.name in files
-                ):
-                    file_url = save_file_and_get_url(files[field.name])
-                    setattr(obj, field.name, file_url)
-
             # Update parent object
             for k, v in parent_data.items():
-                setattr(obj, k, v)
+                if files and k in files:
+                    file_url = self.save_file_and_get_url(files[k])
+                    field = next((f for f in model._meta.fields if f.name == k), None)
+                    if field and field.get_internal_type() == "JSONField":
+                        file_url = {"src": file_url, "title": files[k].name}
 
+                    setattr(obj, field.name, file_url)
+
+                elif v is None or "blob:" not in str(v):
+                    setattr(obj, k, v)
+
+            # try:
+            #     obj.full_clean()  # Validate model before saving
+            #     obj.save()
+            # except Exception as e:
+            #     raise e
             try:
-                obj.full_clean()  # Validate model before saving
                 obj.save()
-            except Exception as e:
+            except IntegrityError as e:
+                error_msg = str(e)
+                field_info = {}
+
+                # Parse common database constraint error patterns
+                if "UNIQUE constraint failed" in error_msg:
+                    # SQLite: UNIQUE constraint failed: table.field
+                    import re
+
+                    match = re.search(
+                        r"UNIQUE constraint failed: \w+\.(\w+)", error_msg
+                    )
+                    if match:
+                        field_info["field"] = match.group(1)
+                        field_info["error_type"] = "unique_constraint"
+                elif "duplicate key value violates unique constraint" in error_msg:
+                    # PostgreSQL: duplicate key value violates unique constraint "table_field_key"
+                    import re
+
+                    match = re.search(r"Key \((\w+)\)", error_msg)
+                    if match:
+                        field_info["field"] = match.group(1)
+                        field_info["error_type"] = "unique_constraint"
+                elif "FOREIGN KEY constraint failed" in error_msg:
+                    # SQLite: FOREIGN KEY constraint failed
+                    field_info["error_type"] = "foreign_key_constraint"
+                elif "NOT NULL constraint failed" in error_msg:
+                    # SQLite: NOT NULL constraint failed: table.field
+                    import re
+
+                    match = re.search(
+                        r"NOT NULL constraint failed: \w+\.(\w+)", error_msg
+                    )
+                    if match:
+                        field_info["field"] = match.group(1)
+                        field_info["error_type"] = "not_null_constraint"
+
+                print(f"Database error on field: {field_info}")
                 raise e
+            except Exception as e:
+                # Handle other database-related errors
+                if hasattr(e, "__module__") and "django.db" in str(e.__module__):
+                    print(f"Other database error: {str(e)}")
+                    raise e
+                # Skip non-database validation errors
+                pass
 
             # Handle children recursively
             for child_key, records in children.items():
