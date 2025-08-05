@@ -211,9 +211,9 @@ def parse_filters(filters, Model):
             except Exception:
                 pass
 
-        if isinstance(value, list):
-            # If the value is a single-item list, extract the item
-            value = value[0]
+        # if isinstance(value, list):
+        #     # If the value is a single-item list, extract the item
+        #     value = value[0]
 
         # Check if the field is a UUIDField
         field = next(
@@ -222,7 +222,10 @@ def parse_filters(filters, Model):
         if field and field.get_internal_type() == "UUIDField":
             try:
                 # print("UUID value:", value)
-                value = UUID(value)  # Validate and convert to UUID
+                if isinstance(value, list):
+                    value = [UUID(v) for v in value]
+                else:
+                    value = UUID(value)  # Validate and convert to UUID
             except (ValueError, TypeError):
                 raise ValueError(f"'{value}' is not a valid UUID.")
 
@@ -237,6 +240,7 @@ def parse_filters(filters, Model):
             elif op == "not_eq":
                 q &= ~Q(**{field: value})
             elif op == "in":
+                # import pdb; pdb.set_trace()
                 if isinstance(value, list):
                     q &= Q(**{f"{field}__in": value})
                 else:
@@ -335,6 +339,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
     @staticmethod
     def save_file_and_get_url(file, folder="uploads"):
         default_storage.save(path.join(folder, file.name), file)
+        # return default_storage.url(filename)
         return f"{folder}/{file.name}"
 
     def list(self, request, app_label=None, model_name=None):
@@ -478,7 +483,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
                 if files and field.name in files:
                     file_url = self.save_file_and_get_url(files[field.name])
                     if field.get_internal_type() == "JSONField":
-                        file_url = {"src": file_url, "title": files[field.name].name}
+                        file_url = {"src": file_url, "title": files[field.name]}
 
                     data[field.name] = file_url
 
@@ -528,6 +533,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
         Model = self.get_model(app_label, model_name)
         data = dict(request.POST.dict()) if request.POST else dict(request.data)
         files = request.FILES.dict() if request.FILES else {}
+        print("Update data:", files.get('photo'))
 
         def recursive_update(model, obj, data, parent_obj=None, parent_model=None):
             update_relation(model, data)
