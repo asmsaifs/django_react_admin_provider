@@ -232,7 +232,26 @@ def parse_filters(filters, Model):
         if "|op=" in key:
             field, op = key.split("|op=")
             if op in ("like", "ilike"):
-                q &= Q(**{f"{field}__icontains": value})
+                if isinstance(value, str) and '%' in value:
+                    # Convert SQL-like % wildcards to Django's icontains/startswith/endswith
+                    if value.startswith('%') and value.endswith('%'):
+                        # %value% -> icontains
+                        clean_value = value.strip('%')
+                        q &= Q(**{f"{field}__icontains": clean_value})
+                    elif value.endswith('%'):
+                        # value% -> startswith
+                        clean_value = value.rstrip('%')
+                        q &= Q(**{f"{field}__startswith": clean_value})
+                    elif value.startswith('%'):
+                        # %value -> endswith
+                        clean_value = value.lstrip('%')
+                        q &= Q(**{f"{field}__endswith": clean_value})
+                    else:
+                        # Contains % but not at start/end, treat as literal
+                        q &= Q(**{f"{field}__icontains": value})
+                else:
+                    # No % wildcards, default behavior
+                    q &= Q(**{f"{field}__icontains": value})
             elif op == "gt":
                 q &= Q(**{f"{field}__gt": value})
             elif op == "lt":
@@ -519,7 +538,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
         try:
             parent_obj = recursive_create(Model, data)
         except ValidationError as e:
-            return Response(e.message_dict, status=status.HTTP_400_BAD_REQUEST)
+            return Response(e.error_list, status=status.HTTP_400_BAD_REQUEST)
         except IntegrityError as e:
             # Example for unique constraint violation
             return Response(
@@ -713,7 +732,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
                 obj.save()  # Validate model before creating
                 # obj = model.objects.create(**parent_data)
             except ValidationError as e:
-                return Response(e.message_dict, status=status.HTTP_400_BAD_REQUEST)
+                return Response(e.error_list, status=status.HTTP_400_BAD_REQUEST)
             except IntegrityError as e:
                 # Example for unique constraint violation
                 return Response(
@@ -737,7 +756,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
             recursive_update(Model, obj, data)
             return Response(model_to_dict(obj))
         except ValidationError as e:
-            return Response(e.message_dict, status=status.HTTP_400_BAD_REQUEST)
+            return Response(e.error_list, status=status.HTTP_400_BAD_REQUEST)
         except IntegrityError as e:
             # Example for unique constraint violation
             return Response(
@@ -795,7 +814,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
             # Model.objects.full_clean()  # Validate model before creating
             Model.objects.bulk_create(objects)
         except ValidationError as e:
-            return Response(e.message_dict, status=status.HTTP_400_BAD_REQUEST)
+            return Response(e.error_list, status=status.HTTP_400_BAD_REQUEST)
         except IntegrityError as e:
             # Example for unique constraint violation
             return Response(
@@ -838,22 +857,23 @@ class DynamicModelViewSet(viewsets.ViewSet):
         data = [model_to_dict(obj, embed=valid_embeds) for obj in queryset]
         return Response(data)
 
-    @action(detail=False, methods=["get"])
+    @action(detail=False, methods=["put"])
     def update_many(self, request, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
-        filters = eval(request.GET.dict().get("filter", "{}"))
+        ids = request.data.get("ids", [])
+        # filters = eval(request.GET.dict().get("filter", "{}"))
         # ids = request.data.get("filter", {}).get("id", [])
-        ids = filters.get("id", [])
+        # ids = filters.get("id", [])
         update_data = request.data.get("data", {})
         Model.objects.filter(id__in=ids).update(**update_data)
         return Response(ids)
 
-    @action(detail=False, methods=["get"])
+    @action(detail=False, methods=["delete"])
     def delete_many(self, request, app_label=None, model_name=None):
         Model = self.get_model(app_label, model_name)
-        filters = eval(request.GET.dict().get("filter", "{}"))
+        ids = request.data.get("ids", [])
         # ids = request.data.get("filter", {}).get("id", [])
-        ids = filters.get("id", [])
+        # ids = filters.get("id", [])
         if hasattr(Model, "is_deleted"):
             Model.objects.filter(id__in=ids).update(is_deleted=True)
         else:
