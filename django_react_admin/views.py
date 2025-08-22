@@ -538,7 +538,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
         try:
             parent_obj = recursive_create(Model, data)
         except ValidationError as e:
-            return Response(e.error_list, status=status.HTTP_400_BAD_REQUEST)
+            return Response(e.error_dict, status=status.HTTP_400_BAD_REQUEST)
         except IntegrityError as e:
             # Example for unique constraint violation
             return Response(
@@ -756,7 +756,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
             recursive_update(Model, obj, data)
             return Response(model_to_dict(obj))
         except ValidationError as e:
-            return Response(e.error_list, status=status.HTTP_400_BAD_REQUEST)
+            return Response(e.error_dict, status=status.HTTP_400_BAD_REQUEST)
         except IntegrityError as e:
             # Example for unique constraint violation
             return Response(
