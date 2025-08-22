@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime
 from uuid import UUID
+from typing import Any, Dict, Optional, Tuple
 
 from django.apps import apps
 from django.db import transaction
@@ -20,6 +21,153 @@ from os import path
 from django.core.files.storage import default_storage
 
 logger = logging.getLogger(__name__)
+
+
+# === Utility functions translated from provided PHP logic for ID generation ===
+def _get_last_raw_year(instance: Any, year_source_field: str = "issued_date") -> Optional[int]:
+    """Extract the year from a date/datetime field on the instance.
+
+    Mirrors getLastRawYear in the PHP version. By default expects an 'issued_date'
+    attribute; falls back to 'created_at' if not present.
+    """
+    if not instance:
+        return None
+    field_name = None
+    if hasattr(instance, year_source_field):
+        field_name = year_source_field
+    elif hasattr(instance, "created_at"):
+        field_name = "created_at"
+    if not field_name:
+        return None
+    value = getattr(instance, field_name)
+    if not value:
+        return None
+    try:
+        return value.year
+    except AttributeError:
+        try:
+            # If string
+            dt = datetime.fromisoformat(str(value))
+            return dt.year
+        except Exception:
+            return None
+
+
+def _generate_unique_numeric_id(
+    model_cls,
+    column: str,
+    last_id_value: Any = 0,
+    prefix: str = "",
+    starts_every: str = "",
+    conditions: Optional[Dict[str, Any]] = None,
+    year_source_field: str = "issued_date",
+) -> int:
+    """Recursive uniqueness generation similar to PHP generateUniqId.
+
+    Strips prefix from last id if present, increments, and checks existence under constraints.
+    """
+    conditions = conditions or {}
+    # Strip prefix if present
+    if prefix and isinstance(last_id_value, str) and last_id_value.startswith(prefix):
+        numeric_part = last_id_value[len(prefix):]
+    else:
+        numeric_part = last_id_value
+    try:
+        numeric_part_int = int(numeric_part or 0)
+    except (ValueError, TypeError):
+        numeric_part_int = 0
+    new_id = numeric_part_int + 1
+
+    query = model_cls.objects.filter(**{column: f"{new_id}" if prefix else new_id})
+
+    if conditions:
+        query = query.filter(**conditions)
+        # In PHP: when conditions given, they also restrict to current year
+        if starts_every in ("year", "month") or True:  # replicate PHP's unconditional year limitation when conditions
+            if hasattr(model_cls, "created_at"):
+                query = query.filter(created_at__year=datetime.utcnow().year)
+
+    # starts_every logic
+    if starts_every == "year":
+        if hasattr(model_cls, "created_at"):
+            query = query.filter(created_at__year=datetime.utcnow().year)
+    elif starts_every == "month":
+        if hasattr(model_cls, "created_at"):
+            now = datetime.utcnow()
+            query = query.filter(created_at__year=now.year, created_at__month=now.month)
+
+    if query.exists():
+        return _generate_unique_numeric_id(
+            model_cls,
+            column,
+            new_id,
+            prefix,
+            starts_every,
+            conditions,
+            year_source_field,
+        )
+    return new_id
+
+
+def generate_human_readable_id(
+    model_cls,
+    column: str,
+    options: Optional[Dict[str, Any]] = None,
+    year_source_field: str = "issued_date",
+) -> Tuple[str, int]:
+    """Python equivalent of provided PHP generate_id.
+
+    Returns a tuple of (formatted_id, raw_numeric_part).
+    Options keys:
+        prefix, pad_length, pad_string, pad_type ('right' for right padding else left),
+        starts_every ('year'|'month'|''), conditions (dict), source (any truthy triggers reset logic)
+    """
+    options = options or {}
+    prefix = options.get("prefix", "")
+    pad_length = options.get("pad_length", 4)
+    pad_string = options.get("pad_string", "0")
+    pad_type = options.get("pad_type", "")  # 'right' else left
+    starts_every = options.get("starts_every", "")
+    conditions = options.get("conditions", {}) or {}
+
+    # Build base queryset applying conditions and period constraints
+    queryset = model_cls.objects.all()
+    if conditions:
+        queryset = queryset.filter(**conditions)
+    now = datetime.utcnow()
+    if starts_every == "year" and hasattr(model_cls, "created_at"):
+        queryset = queryset.filter(created_at__year=now.year)
+    elif starts_every == "month" and hasattr(model_cls, "created_at"):
+        queryset = queryset.filter(created_at__year=now.year, created_at__month=now.month)
+
+    # Fetch last row (latest by created_at if exists else pk)
+    if hasattr(model_cls, "created_at"):
+        last_row = queryset.exclude(**{f"{column}__isnull": True}).order_by("-created_at").first()
+    else:
+        last_row = queryset.exclude(**{f"{column}__isnull": True}).order_by("-pk").first()
+    last_id = getattr(last_row, column, 0) if last_row else 0
+    last_id = last_id or 0
+
+    if options.get("source"):
+        # If year changed vs last row's year source, reset to 1
+        last_year = _get_last_raw_year(last_row, year_source_field)
+        if last_year is not None and last_year != now.year:
+            uniq_id = 1
+        else:
+            uniq_id = _generate_unique_numeric_id(
+                model_cls, column, last_id, prefix, starts_every, conditions, year_source_field
+            )
+    else:
+        uniq_id = _generate_unique_numeric_id(
+            model_cls, column, last_id, prefix, starts_every, conditions, year_source_field
+        )
+
+    # Pad
+    if pad_type == "right":
+        formatted = f"{prefix}{str(uniq_id).ljust(pad_length, pad_string)}"
+    else:
+        formatted = f"{prefix}{str(uniq_id).rjust(pad_length, pad_string)}"
+    return formatted, uniq_id
 
 
 class AdminFullAccess(BasePermission):
@@ -909,6 +1057,49 @@ class DynamicModelViewSet(viewsets.ViewSet):
         Model.objects.bulk_create(objects)
 
         return Response({"message": "Imported successfully"})
+
+    @action(detail=False, methods=["get", "post"], url_path="generate_id")
+    def generate_id_action(self, request, app_label=None, model_name=None):
+        """Generate a formatted incremental ID similar to the provided PHP logic.
+
+        Accepts parameters via query string or JSON body:
+            column (str, required) - model field to store numeric/string id
+            options (json string or object) - options dict
+            year_source_field (str) - optional field name for year change detection
+        """
+        Model = self.get_model(app_label, model_name)
+        # Gather data from request
+        data = {}
+        if request.method == "GET":
+            data = request.GET.dict()
+        else:
+            if isinstance(request.data, dict):
+                data = dict(request.data)
+        column = data.get("column")
+        if not column:
+            return Response({"error": "'column' parameter required"}, status=400)
+        # Validate column exists
+        field_names = [f.name for f in Model._meta.fields]
+        if column not in field_names:
+            return Response({"error": f"Column '{column}' not found on model"}, status=400)
+
+        raw_options = data.get("options", {})
+        if isinstance(raw_options, str):
+            try:
+                raw_options = json.loads(raw_options)
+            except json.JSONDecodeError:
+                return Response({"error": "'options' must be valid JSON"}, status=400)
+        if raw_options is None:
+            raw_options = {}
+        year_source_field = data.get("year_source_field", "issued_date")
+        try:
+            formatted, raw_numeric = generate_human_readable_id(
+                Model, column, raw_options, year_source_field=year_source_field
+            )
+        except Exception as e:
+            logger.exception("Failed generating id")
+            return Response({"error": str(e)}, status=400)
+        return Response({"id": formatted, "raw": raw_numeric})
 
 
 @api_view(["GET"])
