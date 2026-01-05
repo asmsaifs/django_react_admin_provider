@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 
 
 # === Utility functions translated from provided PHP logic for ID generation ===
-def _get_last_raw_year(instance: Any, year_source_field: str = "issued_date") -> Optional[int]:
+def _get_last_raw_year(
+    instance: Any, year_source_field: str = "issued_date"
+) -> Optional[int]:
     """Extract the year from a date/datetime field on the instance.
 
     Mirrors getLastRawYear in the PHP version. By default expects an 'issued_date'
@@ -69,7 +71,7 @@ def _generate_unique_numeric_id(
     conditions = conditions or {}
     # Strip prefix if present
     if prefix and isinstance(last_id_value, str) and last_id_value.startswith(prefix):
-        numeric_part = last_id_value[len(prefix):]
+        numeric_part = last_id_value[len(prefix) :]
     else:
         numeric_part = last_id_value
     try:
@@ -83,7 +85,9 @@ def _generate_unique_numeric_id(
     if conditions:
         query = query.filter(**conditions)
         # In PHP: when conditions given, they also restrict to current year
-        if starts_every in ("year", "month") or True:  # replicate PHP's unconditional year limitation when conditions
+        if (
+            starts_every in ("year", "month") or True
+        ):  # replicate PHP's unconditional year limitation when conditions
             if hasattr(model_cls, "created_at"):
                 query = query.filter(created_at__year=datetime.utcnow().year)
 
@@ -138,13 +142,21 @@ def generate_human_readable_id(
     if starts_every == "year" and hasattr(model_cls, "created_at"):
         queryset = queryset.filter(created_at__year=now.year)
     elif starts_every == "month" and hasattr(model_cls, "created_at"):
-        queryset = queryset.filter(created_at__year=now.year, created_at__month=now.month)
+        queryset = queryset.filter(
+            created_at__year=now.year, created_at__month=now.month
+        )
 
     # Fetch last row (latest by created_at if exists else pk)
     if hasattr(model_cls, "created_at"):
-        last_row = queryset.exclude(**{f"{column}__isnull": True}).order_by("-created_at").first()
+        last_row = (
+            queryset.exclude(**{f"{column}__isnull": True})
+            .order_by("-created_at")
+            .first()
+        )
     else:
-        last_row = queryset.exclude(**{f"{column}__isnull": True}).order_by("-pk").first()
+        last_row = (
+            queryset.exclude(**{f"{column}__isnull": True}).order_by("-pk").first()
+        )
     last_id = getattr(last_row, column, 0) if last_row else 0
     last_id = last_id or 0
 
@@ -155,11 +167,23 @@ def generate_human_readable_id(
             uniq_id = 1
         else:
             uniq_id = _generate_unique_numeric_id(
-                model_cls, column, last_id, prefix, starts_every, conditions, year_source_field
+                model_cls,
+                column,
+                last_id,
+                prefix,
+                starts_every,
+                conditions,
+                year_source_field,
             )
     else:
         uniq_id = _generate_unique_numeric_id(
-            model_cls, column, last_id, prefix, starts_every, conditions, year_source_field
+            model_cls,
+            column,
+            last_id,
+            prefix,
+            starts_every,
+            conditions,
+            year_source_field,
         )
 
     # Pad
@@ -380,19 +404,19 @@ def parse_filters(filters, Model):
         if "|op=" in key:
             field, op = key.split("|op=")
             if op in ("like", "ilike"):
-                if isinstance(value, str) and '%' in value:
+                if isinstance(value, str) and "%" in value:
                     # Convert SQL-like % wildcards to Django's icontains/startswith/endswith
-                    if value.startswith('%') and value.endswith('%'):
+                    if value.startswith("%") and value.endswith("%"):
                         # %value% -> icontains
-                        clean_value = value.strip('%')
+                        clean_value = value.strip("%")
                         q &= Q(**{f"{field}__icontains": clean_value})
-                    elif value.endswith('%'):
+                    elif value.endswith("%"):
                         # value% -> startswith
-                        clean_value = value.rstrip('%')
+                        clean_value = value.rstrip("%")
                         q &= Q(**{f"{field}__startswith": clean_value})
-                    elif value.startswith('%'):
+                    elif value.startswith("%"):
                         # %value -> endswith
-                        clean_value = value.lstrip('%')
+                        clean_value = value.lstrip("%")
                         q &= Q(**{f"{field}__endswith": clean_value})
                     else:
                         # Contains % but not at start/end, treat as literal
@@ -557,6 +581,8 @@ class DynamicModelViewSet(viewsets.ViewSet):
             queryset = queryset.filter(parse_filters(filters, Model))
         if hasattr(Model, "is_deleted"):
             queryset = queryset.filter(is_deleted=False)
+        if hasattr(Model, "is_active"):
+            queryset = queryset.filter(is_active=True)
         if (
             hasattr(Model, "unit_id")
             and "unit_id" not in filters
@@ -700,7 +726,7 @@ class DynamicModelViewSet(viewsets.ViewSet):
         Model = self.get_model(app_label, model_name)
         data = dict(request.POST.dict()) if request.POST else dict(request.data)
         files = request.FILES.dict() if request.FILES else {}
-        print("Update data:", files.get('photo'))
+        print("Update data:", files.get("photo"))
 
         def recursive_update(model, obj, data, parent_obj=None, parent_model=None):
             update_relation(model, data)
@@ -969,9 +995,14 @@ class DynamicModelViewSet(viewsets.ViewSet):
                 {"non_field_errors": [str(e)]}, status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Fetch the created objects from DB to get proper related object instances
+        created_ids = [obj.pk for obj in objects]
+        created_objects = Model.objects.filter(pk__in=created_ids)
+
         # Return created objects as list of dicts
         return Response(
-            [model_to_dict(obj) for obj in objects], status=status.HTTP_201_CREATED
+            [model_to_dict(obj) for obj in created_objects],
+            status=status.HTTP_201_CREATED,
         )
 
     @action(detail=False, methods=["post", "get"])
@@ -1081,7 +1112,9 @@ class DynamicModelViewSet(viewsets.ViewSet):
         # Validate column exists
         field_names = [f.name for f in Model._meta.fields]
         if column not in field_names:
-            return Response({"error": f"Column '{column}' not found on model"}, status=400)
+            return Response(
+                {"error": f"Column '{column}' not found on model"}, status=400
+            )
 
         raw_options = data.get("options", {})
         if isinstance(raw_options, str):
