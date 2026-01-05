@@ -2,4 +2,3 @@
 .python-version
 dist/
 .vscode
-.vscode/settings.json
